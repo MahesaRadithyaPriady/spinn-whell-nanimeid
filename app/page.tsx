@@ -1516,7 +1516,7 @@ export default function Home() {
                   <div className="inline-flex items-center gap-1.5 text-xs text-zinc-400">
                     {/* eslint-disable-next-line @next/next/no-img-element */}
                     <img src="/img/sharp.png" alt="Sharp Token" className="h-3.5 w-3.5 rounded-sm" />
-                    <span>99 Sharp Token</span>
+                    <span>99-50 Sharp Token</span>
                   </div>
                 </div>
                 <div className="mt-3 flex gap-3 overflow-x-auto pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
