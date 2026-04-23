@@ -14,7 +14,7 @@ import {
   Ticket,
   XCircle,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, memo } from "react";
 
 type SpinReward = {
   id: string;
@@ -186,12 +186,224 @@ function getNextDailyResetSeconds(now: Date) {
   return Math.max(0, Math.floor((next.getTime() - now.getTime()) / 1000));
 }
 
+const ITEM_H = 96;
+const SPIN_SPEED = 800; // px/s saat full speed
+const DECEL_DURATION = 600; // ms untuk melambat ke target
+
+const SlotReel = memo(function SlotReel({
+  segments,
+  result,
+  isSpinning,
+  isSlotPaused,
+  reelIdx,
+  isHighlighted,
+}: {
+  segments: SpinReward[];
+  result: SpinReward | null;
+  isSpinning: boolean;
+  isSlotPaused: boolean;
+  reelIdx: number;
+  isHighlighted: boolean;
+}) {
+  const stripRef = useRef<HTMLDivElement>(null);
+  const rafRef = useRef<number>(0);
+  const offsetRef = useRef(0);
+  const phaseRef = useRef<"idle" | "spin" | "decel">("idle");
+  const decelStartRef = useRef(0);
+  const decelFromRef = useRef(0);
+  const decelToRef = useRef(0);
+
+  useEffect(() => {
+    const strip = stripRef.current;
+    if (!strip) return;
+
+    const totalH = segments.length * ITEM_H;
+
+    if (!isSpinning || isSlotPaused) {
+      // Langsung snap ke posisi tengah result
+      cancelAnimationFrame(rafRef.current);
+      phaseRef.current = "idle";
+      if (result && segments.length) {
+        const idx = segments.findIndex(s => s.id === result.id);
+        const targetIdx = idx >= 0 ? idx : 0;
+        // posisi yang menempatkan item tepat di tengah viewport (h-24)
+        const targetOffset = (targetIdx * ITEM_H) % totalH;
+        offsetRef.current = targetOffset;
+        strip.style.transform = `translateY(-${targetOffset}px)`;
+      } else {
+        strip.style.transform = "translateY(0)";
+        offsetRef.current = 0;
+      }
+      return;
+    }
+
+    // Mulai spin
+    phaseRef.current = "spin";
+    let last = performance.now();
+
+    // delay start per reel supaya terasa asinkron
+    const startDelay = reelIdx * 60;
+
+    const tick = (now: number) => {
+      const dt = Math.min((now - last) / 1000, 0.05);
+      last = now;
+
+      if (phaseRef.current === "spin") {
+        offsetRef.current = (offsetRef.current + SPIN_SPEED * dt) % totalH;
+        strip.style.transform = `translateY(-${offsetRef.current}px)`;
+      } else if (phaseRef.current === "decel") {
+        const elapsed = now - decelStartRef.current;
+        const t = Math.min(elapsed / DECEL_DURATION, 1);
+        // ease-out cubic
+        const ease = 1 - Math.pow(1 - t, 3);
+        const cur = decelFromRef.current + (decelToRef.current - decelFromRef.current) * ease;
+        strip.style.transform = `translateY(-${cur}px)`;
+        if (t >= 1) {
+          offsetRef.current = decelToRef.current % totalH;
+          phaseRef.current = "idle";
+          return;
+        }
+      }
+
+      rafRef.current = requestAnimationFrame(tick);
+    };
+
+    const timeout = setTimeout(() => {
+      rafRef.current = requestAnimationFrame(tick);
+    }, startDelay);
+
+    return () => {
+      clearTimeout(timeout);
+      cancelAnimationFrame(rafRef.current);
+    };
+  }, [isSpinning, isSlotPaused, segments, result, reelIdx]);
+
+  // Trigger decel saat result masuk dan masih spinning
+  useEffect(() => {
+    if (!result || !isSpinning || isSlotPaused) return;
+    const totalH = segments.length * ITEM_H;
+    const idx = segments.findIndex(s => s.id === result.id);
+    const targetIdx = idx >= 0 ? idx : 0;
+
+    // hitung target offset: selalu maju ke depan dari posisi saat ini
+    let targetOffset = (targetIdx * ITEM_H) % totalH;
+    const cur = offsetRef.current % totalH;
+    if (targetOffset <= cur) targetOffset += totalH;
+    // tambah satu putaran penuh supaya ada jarak melambat
+    targetOffset += totalH;
+
+    decelFromRef.current = offsetRef.current;
+    decelToRef.current = targetOffset;
+    decelStartRef.current = performance.now() + reelIdx * 80;
+    phaseRef.current = "decel";
+  }, [result, isSpinning, isSlotPaused, segments, reelIdx]);
+
+  const displaySeg = result ?? segments[reelIdx % segments.length]!;
+
+  const renderIcon = (seg: SpinReward) =>
+    seg.imageUrl ? (
+      // eslint-disable-next-line @next/next/no-img-element
+      <img src={seg.imageUrl} alt={seg.label} className="h-8 w-8 rounded-lg border border-white/10 object-cover" />
+    ) : seg.prizeType === "border" ? (
+      <Gift className="h-7 w-7 text-rose-300" />
+    ) : seg.prizeType === "coin" ? (
+      <Coins className="h-7 w-7 text-amber-300" />
+    ) : seg.prizeType === "sharp_token" || seg.label?.toLowerCase().includes("token") ? (
+      // eslint-disable-next-line @next/next/no-img-element
+      <img src="/img/sharp.png" alt="Sharp Token" className="h-7 w-7 rounded-md" />
+    ) : seg.rarity === "unlucky" ? (
+      <XCircle className="h-7 w-7 text-zinc-500" />
+    ) : (
+      <Star className="h-7 w-7 text-cyan-300" />
+    );
+
+  const renderLabel = (seg: SpinReward) => (
+    <span className="line-clamp-1 text-center text-[10px] text-zinc-300">
+      {seg.amount != null ? `${seg.label} +${seg.amount}` : seg.label}
+    </span>
+  );
+
+  return (
+    <div
+      className={`relative flex h-24 flex-1 overflow-hidden rounded-2xl border bg-zinc-900 transition-colors duration-300 ${
+        isHighlighted ? "border-rose-400/60 shadow-[0_0_20px_rgba(244,63,94,0.35)]" : "border-white/10"
+      }`}
+    >
+      <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-8 bg-gradient-to-b from-zinc-900 to-transparent" />
+      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-8 bg-gradient-to-t from-zinc-900 to-transparent" />
+
+      {/* Strip selalu di DOM, digerakkan rAF */}
+      <div ref={stripRef} className="flex w-full flex-col" style={{ willChange: "transform" }}>
+        {[...segments, ...segments, ...segments].map((seg, si) => (
+          <div key={si} style={{ height: ITEM_H, flexShrink: 0 }} className="flex w-full flex-col items-center justify-center gap-1 px-2">
+            {renderIcon(seg)}
+            {renderLabel(seg)}
+          </div>
+        ))}
+      </div>
+
+      {/* Overlay result saat idle */}
+      {(!isSpinning || isSlotPaused) && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-zinc-900 px-2">
+          {renderIcon(displaySeg)}
+          {renderLabel(displaySeg)}
+        </div>
+      )}
+    </div>
+  );
+});
+
+const SPECIAL_STARS = Array.from({ length: 20 }, (_, i) => {
+  const angle = (i / 20) * 360 + (i % 2 === 0 ? 9 : 0);
+  const dist = 55 + (i % 3) * 35;
+  return {
+    tx: Math.round(Math.cos((angle * Math.PI) / 180) * dist),
+    ty: Math.round(Math.sin((angle * Math.PI) / 180) * dist),
+    tr: (i * 37) % 360,
+    delay: (i * 0.045).toFixed(3),
+    size: 10 + (i % 5) * 3,
+  };
+});
+
+function SpecialBurstOverlay() {
+  return (
+    <div className="pointer-events-none absolute inset-0 z-50 overflow-hidden rounded-3xl">
+      {/* radial amber glow */}
+      <div className="special-overlay absolute inset-0 rounded-3xl bg-[radial-gradient(ellipse_at_center,rgba(251,191,36,0.6)_0%,rgba(251,191,36,0.18)_45%,transparent_70%)]" />
+      {/* bintang meledak dari tengah */}
+      {SPECIAL_STARS.map((s, i) => (
+        <div
+          key={i}
+          className="special-star absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 text-amber-300"
+          style={{
+            ["--tx" as string]: `${s.tx}px`,
+            ["--ty" as string]: `${s.ty}px`,
+            ["--tr" as string]: `${s.tr}deg`,
+            animationDelay: s.delay + "s",
+            fontSize: s.size,
+            lineHeight: 1,
+          }}
+        >
+          ★
+        </div>
+      ))}
+      {/* label SPECIAL */}
+      <div className="special-overlay absolute inset-x-0 top-1/2 -translate-y-1/2 text-center">
+        <span className="special-glow inline-block rounded-full bg-amber-400/20 px-5 py-1 text-sm font-bold tracking-widest text-amber-300 shadow-[0_0_28px_rgba(251,191,36,0.7)]">
+          ✦ SPECIAL ✦
+        </span>
+      </div>
+    </div>
+  );
+}
+
 export default function Home() {
   const apiBase = process.env.NEXT_PUBLIC_API_BASE ?? "";
   const apiVersion = process.env.NEXT_PUBLIC_API_VERSION ?? "";
   const debugLoginEnabled = process.env.NEXT_PUBLIC_DEBUG_LOGIN === "true";
   const [eventCode, setEventCode] = useState<string | null>(null);
   const [missingEventCode, setMissingEventCode] = useState(false);
+  const [spinMode, setSpinMode] = useState<"wheel" | "slot">("wheel");
 
   const [prizePool, setPrizePool] = useState<SpinReward[]>([]);
 
@@ -256,22 +468,22 @@ export default function Home() {
   const wheelSegments: SpinReward[] = useMemo(() => {
     if (!prizePool.length) return [];
 
-    const slots = 8;
     const map = new Map<number, SpinReward>();
     const unassigned: SpinReward[] = [];
 
     for (const p of prizePool) {
       const idx = p.slotIndex;
       const valid =
-        typeof idx === "number" && Number.isFinite(idx) && idx >= 0 && idx < slots;
+        typeof idx === "number" && Number.isFinite(idx) && idx >= 0;
 
-      if (valid && !map.has(idx)) {
-        map.set(idx, p);
+      if (valid && !map.has(idx!)) {
+        map.set(idx!, p);
       } else {
         unassigned.push(p);
       }
     }
 
+    const slots = prizePool.length;
     const out: SpinReward[] = [];
     for (let i = 0; i < slots; i++) {
       const hit = map.get(i);
@@ -280,22 +492,13 @@ export default function Home() {
       } else {
         const fill = unassigned.shift();
         if (fill) {
-          out.push({
-            ...fill,
-            slotIndex: i,
-          });
-          continue;
+          out.push({ ...fill, slotIndex: i });
         }
-        out.push({
-          id: `empty-${i}`,
-          label: "?",
-          amount: null,
-          imageUrl: null,
-          prizeType: "empty",
-          slotIndex: i,
-          rarity: "unlucky",
-        });
       }
+    }
+
+    for (const leftover of unassigned) {
+      out.push(leftover);
     }
 
     return out;
@@ -348,8 +551,11 @@ export default function Home() {
     getNextDailyResetSeconds(new Date()),
   );
   const [isSpinning, setIsSpinning] = useState(false);
+  const [isSlotPaused, setIsSlotPaused] = useState(false);
   const [result, setResult] = useState<SpinReward | null>(null);
   const [flashKey, setFlashKey] = useState(0);
+  const [specialEffectKey, setSpecialEffectKey] = useState<number | null>(null);
+  const specialShownThisSessionRef = useRef(false);
   const [userToken, setUserToken] = useState(0);
   const [, setBalance] = useState<number | null>(null);
   const [pitySpins, setPitySpins] = useState<number | null>(null);
@@ -360,7 +566,7 @@ export default function Home() {
   const [freeSpinAvailable, setFreeSpinAvailable] = useState<boolean | null>(null);
   const [nextFreeSpinAt, setNextFreeSpinAt] = useState<Date | null>(null);
   const [freeSpinCooldownSeconds, setFreeSpinCooldownSeconds] = useState<number | null>(null);
-  const [apiError, setApiError] = useState(false);
+  const [apiError, setApiError] = useState<string | null>(null);
   const [wheelRotation, setWheelRotation] = useState(0);
 
   const wheelRotationRef = useRef(0);
@@ -440,7 +646,7 @@ export default function Home() {
   async function handleDebugLogin() {
     setDebugLoginLoading(true);
     setDebugLoginError(null);
-    setApiError(false);
+    setApiError(null);
 
     try {
       const res = await fetch(`${apiBase}/${apiVersion}/auth/login`, {
@@ -460,7 +666,13 @@ export default function Home() {
       const refreshToken = "refreshToken" in data ? data.refreshToken : null;
 
       if (!res.ok || !token || !refreshToken) {
-        setDebugLoginError("Terjadi kesalahan");
+        const msg =
+          ("message" in data && typeof data.message === "string" && data.message)
+            ? data.message
+            : ("error" in data && typeof data.error === "string" && data.error)
+              ? data.error
+              : "Username atau password salah";
+        setDebugLoginError(msg);
         setDebugLoginLoading(false);
         return;
       }
@@ -470,7 +682,7 @@ export default function Home() {
       setAuthState("allowed");
       setDebugLoginLoading(false);
     } catch {
-      setDebugLoginError("Terjadi kesalahan");
+      setDebugLoginError("Tidak dapat terhubung ke server");
       setDebugLoginLoading(false);
     }
   }
@@ -478,14 +690,14 @@ export default function Home() {
   const renderDebugLoginPanel = () => {
     return (
       <div className="mt-6 w-full rounded-3xl border border-white/10 bg-white/5 p-5 text-left">
-        <div className="text-sm font-semibold text-zinc-100">Login (Debug)</div>
+        <div className="text-sm font-semibold text-zinc-100">Login</div>
         <div className="mt-3 grid gap-3">
           <label className="grid gap-1 text-xs text-zinc-200/70">
             Username
             <input
               value={debugUsername}
-              onChange={(e) => setDebugUsername(e.target.value)}
-              className="h-11 rounded-2xl border border-white/10 bg-zinc-950/60 px-4 text-sm text-zinc-50 outline-none focus:border-cyan-400/40"
+              onChange={(e) => { setDebugUsername(e.target.value); setDebugLoginError(null); }}
+              className="h-11 rounded-2xl border border-white/10 bg-zinc-950/60 px-4 text-sm text-zinc-50 outline-none focus:border-rose-400/40"
               autoComplete="username"
             />
           </label>
@@ -494,25 +706,19 @@ export default function Home() {
             Password
             <input
               value={debugPassword}
-              onChange={(e) => setDebugPassword(e.target.value)}
-              className="h-11 rounded-2xl border border-white/10 bg-zinc-950/60 px-4 text-sm text-zinc-50 outline-none focus:border-cyan-400/40"
+              onChange={(e) => { setDebugPassword(e.target.value); setDebugLoginError(null); }}
+              className="h-11 rounded-2xl border border-white/10 bg-zinc-950/60 px-4 text-sm text-zinc-50 outline-none focus:border-rose-400/40"
               type="password"
               autoComplete="current-password"
             />
           </label>
 
-          {debugLoginError ? (
-            <div className="rounded-2xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-xs text-zinc-100">
-              {debugLoginError}
-            </div>
-          ) : null}
-
           <button
             onClick={handleDebugLogin}
             disabled={debugLoginLoading || !debugUsername || !debugPassword}
-            className="inline-flex h-11 w-full items-center justify-center rounded-2xl bg-gradient-to-r from-fuchsia-500 to-cyan-400 px-6 text-sm font-semibold text-zinc-950 transition hover:brightness-110 disabled:opacity-60"
+            className="inline-flex h-11 w-full items-center justify-center rounded-2xl bg-gradient-to-r from-rose-500 to-pink-400 px-6 text-sm font-semibold text-zinc-950 transition hover:brightness-110 disabled:opacity-60"
           >
-            {debugLoginLoading ? "LOGIN..." : "LOGIN"}
+            {debugLoginLoading ? "MASUK..." : "MASUK"}
           </button>
         </div>
       </div>
@@ -561,6 +767,10 @@ export default function Home() {
 
     queueMicrotask(applyState);
 
+    const modeRaw = q.get("mode");
+    if (modeRaw === "slot") setSpinMode("slot");
+    else setSpinMode("wheel");
+
     const accessToken = q.get("access_token") ?? h.get("access_token");
     const refreshToken = q.get("refresh_token") ?? h.get("refresh_token");
 
@@ -588,7 +798,7 @@ export default function Home() {
   useEffect(() => {
     if (!eventCode) return;
     const run = async () => {
-      setApiError(false);
+      setApiError(null);
       try {
         const res = await fetch(
           `${apiBase}/${apiVersion}/events/gacha/prizes?event_code=${encodeURIComponent(eventCode)}`,
@@ -596,14 +806,15 @@ export default function Home() {
         const data = (await res.json()) as GachaPrizesResponse;
         logApi("events/gacha/prizes", data);
         if (!res.ok || !data.success) {
-          setApiError(true);
+          const msg = !data.success && "message" in data && data.message ? data.message : null;
+          setApiError(msg ?? `Gagal memuat prize pool (HTTP ${res.status})`);
           return;
         }
 
         const normalized = (data.prizes ?? []).map(toSpinReward);
         setPrizePool(normalized);
-      } catch {
-        setApiError(true);
+      } catch (err) {
+        setApiError(`Tidak dapat terhubung ke server saat memuat prize pool. ${String(err)}`);
       }
     };
 
@@ -616,7 +827,7 @@ export default function Home() {
     if (!eventCode) return;
 
     const run = async () => {
-      setApiError(false);
+      setApiError(null);
 
       const token = sessionStorage.getItem("access_token");
       if (!token) {
@@ -642,7 +853,8 @@ export default function Home() {
         const data = (await res.json()) as GachaStateResponse;
         logApi("events/gacha/state", data);
         if (!res.ok || !data.success) {
-          setApiError(true);
+          const msg = !data.success && "message" in data && data.message ? data.message : null;
+          setApiError(msg ?? `Gagal memuat status event (HTTP ${res.status})`);
           return;
         }
 
@@ -655,8 +867,8 @@ export default function Home() {
         setFreeSpinAvailable(data.freeSpinAvailable ?? null);
         setNextFreeSpinAt(data.nextFreeSpinAt ? new Date(data.nextFreeSpinAt) : null);
         setFreeSpinCooldownSeconds(data.freeSpinCooldownSeconds ?? null);
-      } catch {
-        setApiError(true);
+      } catch (err) {
+        setApiError(`Tidak dapat terhubung ke server saat memuat status event. ${String(err)}`);
       }
     };
 
@@ -889,7 +1101,8 @@ export default function Home() {
       const data = (await res.json()) as GachaSpinResponse;
       logApi("events/gacha/spin", data);
       if (!res.ok || !data.success) {
-        setApiError(true);
+        const msg = !data.success && "message" in data && data.message ? data.message : null;
+        setApiError(msg ?? `Spin gagal (HTTP ${res.status})`);
         setIsSpinning(false);
         return;
       }
@@ -940,8 +1153,8 @@ export default function Home() {
       if (typeof data.freeSpinCooldownSeconds === "number") {
         setFreeSpinCooldownSeconds(data.freeSpinCooldownSeconds);
       }
-    } catch {
-      setApiError(true);
+    } catch (err) {
+      setApiError(`Tidak dapat terhubung ke server saat spin. ${String(err)}`);
       setIsSpinning(false);
       return;
     }
@@ -1035,6 +1248,7 @@ export default function Home() {
     spinQueueRef.current = queue;
     spinQueueTotalRef.current = queue.length;
     spinQueueDoneRef.current = 0;
+    specialShownThisSessionRef.current = false;
 
     const first = spinQueueRef.current.shift() ?? null;
     if (!first) {
@@ -1043,7 +1257,57 @@ export default function Home() {
     }
 
     pendingRewardRef.current = first.reward;
-    setWheelRotation(first.targetRotation);
+
+    if (spinMode === "slot") {
+      const SPIN_DUR = spinDurationMs + DECEL_DURATION + 100; // tunggu decel selesai
+      const PAUSE_DUR = 1000;
+      const processQueue = (reward: SpinReward | null, remaining: typeof queue) => {
+        const st = pendingStateRef.current;
+        // 1. set result → trigger decel di SlotReel via useEffect
+        setResult(reward);
+        setFlashKey((k) => k + 1);
+        if (reward?.rarity === "special" && !specialShownThisSessionRef.current) {
+          specialShownThisSessionRef.current = true;
+          setSpecialEffectKey(Date.now());
+        }
+        // 2. tunggu decel selesai → tampilkan overlay pause
+        setTimeout(() => {
+          setIsSlotPaused(true);
+          const next = remaining[0] ?? null;
+          if (next) {
+            // 3. jeda user lihat result → mulai spin berikutnya
+            setTimeout(() => {
+              setResult(null);
+              setIsSlotPaused(false);
+              setTimeout(() => {
+                pendingRewardRef.current = next.reward;
+                processQueue(next.reward, remaining.slice(1));
+              }, SPIN_DUR);
+            }, PAUSE_DUR);
+            return;
+          }
+          // 4. spin terakhir selesai
+          setTimeout(() => {
+            if (st) {
+              setBalance(st.balance);
+              setUserToken(st.sharpTokens);
+              setPitySpins(st.pitySpins);
+              setPityRemaining(st.pityRemaining);
+              pendingStateRef.current = null;
+            }
+            void refreshWallet();
+            setIsSpinning(false);
+            setIsSlotPaused(false);
+            pendingRewardRef.current = null;
+          }, PAUSE_DUR);
+        }, DECEL_DURATION + 100);
+      };
+      setTimeout(() => {
+        processQueue(first.reward, queue);
+      }, spinDurationMs);
+    } else {
+      setWheelRotation(first.targetRotation);
+    }
   }
 
   if (authState === "checking") {
@@ -1059,6 +1323,40 @@ export default function Home() {
   }
 
   if (authState === "denied") {
+    if (debugLoginEnabled) {
+      return (
+        <div className="min-h-screen bg-zinc-950 text-zinc-50">
+          {/* Popup error toast */}
+          {debugLoginError ? (
+            <div className="fixed inset-x-0 top-6 z-50 flex justify-center px-4">
+              <div className="flex w-full max-w-sm items-start gap-3 rounded-2xl border border-red-500/30 bg-zinc-900 px-5 py-4 shadow-[0_8px_32px_rgba(239,68,68,0.25)]">
+                <XCircle className="mt-0.5 h-5 w-5 flex-shrink-0 text-red-400" aria-hidden />
+                <div className="min-w-0 flex-1">
+                  <div className="text-sm font-semibold text-red-300">Login gagal</div>
+                  <div className="mt-0.5 text-xs text-zinc-300">{debugLoginError}</div>
+                </div>
+                <button onClick={() => setDebugLoginError(null)} className="flex-shrink-0 text-zinc-500 hover:text-zinc-200">
+                  <XCircle className="h-4 w-4" aria-hidden />
+                </button>
+              </div>
+            </div>
+          ) : null}
+          <main className="mx-auto flex min-h-screen w-full max-w-sm flex-col items-center justify-center px-4 py-10">
+            <div className="w-full">
+              <div className="mb-6 text-center">
+                <div className="inline-flex items-center gap-2 rounded-full border border-rose-400/20 bg-rose-500/10 px-4 py-2 text-sm text-zinc-100">
+                  <Sparkles className="h-4 w-4 text-rose-300" aria-hidden />
+                  <span className="font-semibold tracking-wide">GOTOUBUN NO HANAYOME</span>
+                </div>
+                <h1 className="mt-4 text-2xl font-semibold tracking-tight">Masuk untuk lanjut</h1>
+                <p className="mt-2 text-sm text-zinc-200/70">Masukkan akun kamu untuk mengakses event spin.</p>
+              </div>
+              {renderDebugLoginPanel()}
+            </div>
+          </main>
+        </div>
+      );
+    }
     return (
       <div className="min-h-screen bg-zinc-950 text-zinc-50">
         <main className="mx-auto flex min-h-screen w-full max-w-2xl flex-col items-center justify-center px-4 py-10 text-center">
@@ -1066,11 +1364,10 @@ export default function Home() {
             <div className="mx-auto inline-flex h-12 w-12 items-center justify-center rounded-2xl border border-red-500/20 bg-zinc-950/40">
               <ShieldAlert className="h-6 w-6 text-red-300" aria-hidden />
             </div>
-            <h1 className="mt-4 text-2xl font-semibold tracking-tight">Terjadi kesalahan</h1>
+            <h1 className="mt-4 text-2xl font-semibold tracking-tight">Akses ditolak</h1>
             <p className="mt-2 text-sm leading-6 text-zinc-200/80">
               Halaman ini tidak dapat dimuat saat ini. Silakan kembali dan coba lagi.
             </p>
-            {debugLoginEnabled ? renderDebugLoginPanel() : null}
           </div>
         </main>
       </div>
@@ -1089,7 +1386,17 @@ export default function Home() {
             <p className="mt-2 text-sm leading-6 text-zinc-200/80">
               Halaman ini tidak dapat dimuat saat ini. Silakan kembali dan coba lagi.
             </p>
-            {debugLoginEnabled ? renderDebugLoginPanel() : null}
+            {debugLoginEnabled ? (
+              <div className="mt-5 rounded-2xl border border-red-500/20 bg-zinc-950/50 px-4 py-3 text-left">
+                <div className="mb-1 text-xs font-semibold uppercase tracking-widest text-red-400">Detail Error</div>
+                <p className="break-all font-mono text-xs leading-5 text-zinc-300">{apiError}</p>
+                <div className="mt-3 flex flex-wrap gap-2 text-xs text-zinc-400">
+                  <span>API Base: <span className="font-mono text-zinc-200">{process.env.NEXT_PUBLIC_API_BASE ?? "(tidak di-set)"}</span></span>
+                  <span>·</span>
+                  <span>Event: <span className="font-mono text-zinc-200">{eventCode ?? "(tidak ada)"}</span></span>
+                </div>
+              </div>
+            ) : null}
           </div>
         </main>
       </div>
@@ -1100,40 +1407,58 @@ export default function Home() {
     return (
       <div className="min-h-screen bg-zinc-950 text-zinc-50">
         <main className="mx-auto flex min-h-screen w-full max-w-2xl flex-col items-center justify-center px-4 py-10 text-center">
-          <div className="pointer-events-none absolute inset-x-0 top-0 z-10 flex justify-center gap-6 opacity-80">
-            <div className="ketupat-swing mt-2">
+          <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 flex justify-around items-end px-4 opacity-90">
+            <div className="ketupat-swing">
               <Image
-                src="/img/deco-ketupat.jpeg"
-                width={84}
-                height={84}
-                alt="Dekorasi ketupat"
-                className="h-16 w-16 rounded-2xl border border-white/10 object-cover shadow-[0_10px_30px_rgba(0,0,0,0.35)]"
+                src="/img/Ichika_Nakano_FULL_BODY.webp"
+                width={100}
+                height={240}
+                alt="Ichika Nakano"
+                className="h-40 w-auto object-contain drop-shadow-[0_10px_30px_rgba(0,0,0,0.5)]"
                 priority
               />
             </div>
-            <div className="ketupat-swing ketupat-delay-1 -mt-2">
+            <div className="ketupat-swing ketupat-delay-1">
               <Image
-                src="/img/deco-ketupat.jpeg"
-                width={96}
-                height={96}
-                alt="Dekorasi ketupat"
-                className="h-20 w-20 rounded-2xl border border-white/10 object-cover shadow-[0_10px_30px_rgba(0,0,0,0.35)]"
+                src="/img/Nino_Nakano_Short_Hair_FULL_BODY.webp"
+                width={100}
+                height={240}
+                alt="Nino Nakano"
+                className="h-44 w-auto object-contain drop-shadow-[0_10px_30px_rgba(0,0,0,0.5)]"
               />
             </div>
-            <div className="ketupat-swing ketupat-delay-2 mt-3">
+            <div className="ketupat-swing ketupat-delay-2">
               <Image
-                src="/img/deco-ketupat.jpeg"
-                width={84}
-                height={84}
-                alt="Dekorasi ketupat"
-                className="h-16 w-16 rounded-2xl border border-white/10 object-cover shadow-[0_10px_30px_rgba(0,0,0,0.35)]"
+                src="/img/Miku_Nakano_FULL_BODY.webp"
+                width={100}
+                height={240}
+                alt="Miku Nakano"
+                className="h-48 w-auto object-contain drop-shadow-[0_10px_30px_rgba(0,0,0,0.5)]"
+              />
+            </div>
+            <div className="ketupat-swing">
+              <Image
+                src="/img/Yotsuba_Nakano_FULL_BODY.webp"
+                width={100}
+                height={240}
+                alt="Yotsuba Nakano"
+                className="h-44 w-auto object-contain drop-shadow-[0_10px_30px_rgba(0,0,0,0.5)]"
+              />
+            </div>
+            <div className="ketupat-swing ketupat-delay-1">
+              <Image
+                src="/img/Itsuki_Nakano_FULL_BODY.webp"
+                width={100}
+                height={240}
+                alt="Itsuki Nakano"
+                className="h-40 w-auto object-contain drop-shadow-[0_10px_30px_rgba(0,0,0,0.5)]"
               />
             </div>
           </div>
 
-          <div className="w-full rounded-3xl border border-amber-400/20 bg-amber-500/10 p-8 shadow-[0_0_40px_rgba(245,158,11,0.10)]">
-            <div className="mx-auto inline-flex h-12 w-12 items-center justify-center rounded-2xl border border-amber-400/20 bg-zinc-950/40">
-              <ShieldAlert className="h-6 w-6 text-amber-200" aria-hidden />
+          <div className="w-full rounded-3xl border border-rose-400/20 bg-rose-500/10 p-8 shadow-[0_0_40px_rgba(244,63,94,0.10)]">
+            <div className="mx-auto inline-flex h-12 w-12 items-center justify-center rounded-2xl border border-rose-400/20 bg-zinc-950/40">
+              <ShieldAlert className="h-6 w-6 text-rose-200" aria-hidden />
             </div>
             <h1 className="mt-4 text-2xl font-semibold tracking-tight">Event belum dipilih</h1>
             <p className="mt-2 text-sm leading-6 text-zinc-200/80">
@@ -1152,61 +1477,30 @@ export default function Home() {
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-50">
       <main className="mx-auto w-full max-w-6xl px-4 py-10 sm:px-6 lg:px-8">
-        <section className="relative overflow-hidden rounded-3xl border border-white/10 bg-gradient-to-br from-emerald-600/25 via-zinc-950 to-amber-400/15 p-6 sm:p-8">
+        <section className="relative overflow-hidden rounded-3xl border border-white/10 bg-gradient-to-br from-rose-600/25 via-zinc-950 to-pink-400/15 p-6 sm:p-8">
           <div className="pointer-events-none absolute inset-0 opacity-60">
-            <div className="absolute -top-24 left-1/2 h-80 w-80 -translate-x-1/2 rounded-full bg-fuchsia-500/25 blur-3xl" />
-            <div className="absolute -bottom-24 -left-24 h-80 w-80 rounded-full bg-cyan-400/20 blur-3xl" />
+            <div className="absolute -top-24 left-1/2 h-80 w-80 -translate-x-1/2 rounded-full bg-rose-500/25 blur-3xl" />
+            <div className="absolute -bottom-24 -left-24 h-80 w-80 rounded-full bg-pink-400/20 blur-3xl" />
             <div className="absolute -right-24 top-1/3 h-80 w-80 rounded-full bg-violet-400/15 blur-3xl" />
           </div>
 
-          <div className="pointer-events-none absolute inset-x-0 top-0 z-10 flex justify-center gap-6 opacity-80">
-            <div className="ketupat-swing mt-2">
-              <Image
-                src="/img/deco-ketupat.jpeg"
-                width={84}
-                height={84}
-                alt="Dekorasi ketupat"
-                className="h-16 w-16 rounded-2xl border border-white/10 object-cover shadow-[0_10px_30px_rgba(0,0,0,0.35)]"
-                priority
-              />
-            </div>
-            <div className="ketupat-swing ketupat-delay-1 -mt-2">
-              <Image
-                src="/img/deco-ketupat.jpeg"
-                width={96}
-                height={96}
-                alt="Dekorasi ketupat"
-                className="h-20 w-20 rounded-2xl border border-white/10 object-cover shadow-[0_10px_30px_rgba(0,0,0,0.35)]"
-              />
-            </div>
-            <div className="ketupat-swing ketupat-delay-2 mt-3">
-              <Image
-                src="/img/deco-ketupat.jpeg"
-                width={84}
-                height={84}
-                alt="Dekorasi ketupat"
-                className="h-16 w-16 rounded-2xl border border-white/10 object-cover shadow-[0_10px_30px_rgba(0,0,0,0.35)]"
-              />
-            </div>
-          </div>
-
-          <div className="relative grid grid-cols-1 gap-8 lg:grid-cols-12 lg:items-center">
+          <div className="relative grid grid-cols-1 gap-8 lg:grid-cols-12 lg:items-end">
             <div className="lg:col-span-6">
-              <div className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm text-zinc-100">
-                <Sparkles className="h-4 w-4" aria-hidden />
-                <span className="font-semibold tracking-wide">RAMADAN SPIN EVENT</span>
+              <div className="inline-flex items-center gap-2 rounded-full border border-rose-400/20 bg-rose-500/10 px-4 py-2 text-sm text-zinc-100">
+                <Sparkles className="h-4 w-4 text-rose-300" aria-hidden />
+                <span className="font-semibold tracking-wide">GOTOUBUN NO HANAYOME EVENT</span>
               </div>
 
               <h1 className="mt-4 text-3xl font-semibold leading-tight tracking-tight sm:text-4xl">
                 Putar spin & kumpulkan Sharp Token
               </h1>
               <p className="mt-3 max-w-xl text-base leading-7 text-zinc-200/80">
-                Untuk mendapatkan Avatar Border eksklusif.
+                Dapatkan Avatar Border eksklusif Quintuplets!
               </p>
 
               <p className="mt-3 max-w-xl text-sm leading-6 text-zinc-200/70">
                 <Gift className="mr-2 inline-block h-4 w-4" aria-hidden />
-                Border Ramadan hanya tersedia di event ini dan tidak akan dijual ulang.
+                Border Gotoubun hanya tersedia di event ini dan tidak akan dijual ulang.
               </p>
 
               <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:items-center">
@@ -1216,44 +1510,108 @@ export default function Home() {
                 </div>
               </div>
 
-              <div className="mt-7 grid grid-cols-1 gap-3 sm:grid-cols-2">
-                <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+              <div className="mt-7 rounded-2xl border border-rose-400/10 bg-rose-500/5 p-4">
+                <div className="flex items-center justify-between">
                   <div className="text-sm text-zinc-200/80">Avatar Border</div>
-                  <div className="mt-3 flex items-center gap-3">
-                    {borderPrizes.slice(0, 2).map((p, idx) => (
-                      <div
-                        key={`${p.id}-${idx}`}
-                        className="relative h-14 w-14 overflow-hidden rounded-2xl border border-white/10 bg-zinc-900"
-                      >
-                        {p.imageUrl ? (
-                          // eslint-disable-next-line @next/next/no-img-element
-                          <img
-                            src={p.imageUrl}
-                            alt={p.label}
-                            className="h-full w-full object-cover"
-                          />
-                        ) : (
-                          <Gift className="m-auto h-6 w-6 text-zinc-100" aria-hidden />
-                        )}
-                      </div>
-                    ))}
+                  <div className="inline-flex items-center gap-1.5 text-xs text-zinc-400">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src="/img/sharp.png" alt="Sharp Token" className="h-3.5 w-3.5 rounded-sm" />
+                    <span>99 Sharp Token</span>
                   </div>
                 </div>
-
-                <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                  <div className="text-sm text-zinc-200/80">Reward Highlight</div>
-                  <div className="mt-2 text-lg font-semibold">Border Ramadan</div>
-                  <div className="mt-1 inline-flex items-center gap-2 text-sm text-zinc-200/80">
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img src="/img/sharp.png" alt="Sharp Token" className="h-4 w-4 rounded-sm" />
-                    <span>75 Sharp Token</span>
-                  </div>
+                <div className="mt-3 flex gap-3 overflow-x-auto pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+                  {[
+                    { src: "/img/border/ichka.png",  name: "Ichika" },
+                    { src: "/img/border/Nino.png",   name: "Nino" },
+                    { src: "/img/border/miku.png",   name: "Miku" },
+                    { src: "/img/border/itsuki.png", name: "Itsuki" },
+                  ].map((b) => (
+                    <div key={b.name} className="group flex flex-shrink-0 flex-col items-center gap-1.5">
+                      <div className="relative h-24 w-24 overflow-hidden rounded-2xl border border-white/10 bg-zinc-900 transition-transform duration-200 group-hover:scale-105 group-hover:border-rose-400/40">
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img src={b.src} alt={`Border ${b.name}`} className="h-full w-full object-cover" />
+                        <div className="absolute inset-0 rounded-2xl ring-1 ring-inset ring-white/5" />
+                      </div>
+                      <span className="text-[11px] text-zinc-400 group-hover:text-zinc-200">{b.name}</span>
+                    </div>
+                  ))}
                 </div>
               </div>
             </div>
 
-            <div className="lg:col-span-6">
-              <div className="mx-auto h-[360px] w-full max-w-2xl sm:h-[420px]" />
+            {/* Mobile character stack — tampil di bawah teks, sembunyi di desktop */}
+            <div className="relative h-48 w-full lg:hidden">
+              <div className="absolute bottom-0 left-0 z-[1]">
+                <Image src="/img/Ichika_Nakano_FULL_BODY.webp" width={90} height={220} alt="Ichika Nakano" className="h-36 w-auto object-contain drop-shadow-[0_8px_20px_rgba(0,0,0,0.5)]" priority />
+              </div>
+              <div className="absolute bottom-0 left-[15%] z-[2]">
+                <Image src="/img/Nino_Nakano_Short_Hair_FULL_BODY.webp" width={95} height={240} alt="Nino Nakano" className="h-40 w-auto object-contain drop-shadow-[0_8px_20px_rgba(0,0,0,0.55)]" />
+              </div>
+              <div className="absolute bottom-0 left-1/2 z-[5] -translate-x-1/2">
+                <Image src="/img/Miku_Nakano_FULL_BODY.webp" width={105} height={260} alt="Miku Nakano" className="h-48 w-auto object-contain drop-shadow-[0_10px_28px_rgba(0,0,0,0.7)]" />
+              </div>
+              <div className="absolute bottom-0 right-[15%] z-[2]">
+                <Image src="/img/Yotsuba_Nakano_FULL_BODY.webp" width={95} height={240} alt="Yotsuba Nakano" className="h-40 w-auto object-contain drop-shadow-[0_8px_20px_rgba(0,0,0,0.55)]" />
+              </div>
+              <div className="absolute bottom-0 right-0 z-[1]">
+                <Image src="/img/Itsuki_Nakano_FULL_BODY.webp" width={90} height={220} alt="Itsuki Nakano" className="h-36 w-auto object-contain drop-shadow-[0_8px_20px_rgba(0,0,0,0.5)]" />
+              </div>
+            </div>
+
+            <div className="hidden lg:col-span-6 lg:block">
+              <div className="relative h-80 w-full">
+                {/* Ichika — paling belakang kiri */}
+                <div className="absolute bottom-0 left-0 z-[1] transition-transform duration-300 hover:-translate-y-2">
+                  <Image
+                    src="/img/Ichika_Nakano_FULL_BODY.webp"
+                    width={130}
+                    height={340}
+                    alt="Ichika Nakano"
+                    className="h-60 w-auto object-contain drop-shadow-[0_12px_32px_rgba(0,0,0,0.5)]"
+                    priority
+                  />
+                </div>
+                {/* Nino — kiri tengah */}
+                <div className="absolute bottom-0 left-[15%] z-[2] transition-transform duration-300 hover:-translate-y-2">
+                  <Image
+                    src="/img/Nino_Nakano_Short_Hair_FULL_BODY.webp"
+                    width={140}
+                    height={360}
+                    alt="Nino Nakano"
+                    className="h-[272px] w-auto object-contain drop-shadow-[0_12px_32px_rgba(0,0,0,0.55)]"
+                  />
+                </div>
+                {/* Miku — paling depan tengah */}
+                <div className="absolute bottom-0 left-1/2 z-[5] -translate-x-1/2 transition-transform duration-300 hover:-translate-y-2">
+                  <Image
+                    src="/img/Miku_Nakano_FULL_BODY.webp"
+                    width={155}
+                    height={400}
+                    alt="Miku Nakano"
+                    className="h-80 w-auto object-contain drop-shadow-[0_16px_40px_rgba(0,0,0,0.7)]"
+                  />
+                </div>
+                {/* Yotsuba — kanan tengah */}
+                <div className="absolute bottom-0 right-[15%] z-[2] transition-transform duration-300 hover:-translate-y-2">
+                  <Image
+                    src="/img/Yotsuba_Nakano_FULL_BODY.webp"
+                    width={140}
+                    height={360}
+                    alt="Yotsuba Nakano"
+                    className="h-[272px] w-auto object-contain drop-shadow-[0_12px_32px_rgba(0,0,0,0.55)]"
+                  />
+                </div>
+                {/* Itsuki — paling belakang kanan */}
+                <div className="absolute bottom-0 right-0 z-[1] transition-transform duration-300 hover:-translate-y-2">
+                  <Image
+                    src="/img/Itsuki_Nakano_FULL_BODY.webp"
+                    width={130}
+                    height={340}
+                    alt="Itsuki Nakano"
+                    className="h-60 w-auto object-contain drop-shadow-[0_12px_32px_rgba(0,0,0,0.5)]"
+                  />
+                </div>
+              </div>
             </div>
           </div>
         </section>
@@ -1262,7 +1620,7 @@ export default function Home() {
           <div className="rounded-3xl border border-white/10 bg-white/5 p-6 lg:col-span-7">
             <div className="flex items-start justify-between gap-4">
               <div>
-                <div className="text-sm text-zinc-200/80">SPIN WHEEL</div>
+                <div className="text-sm text-zinc-200/80">{spinMode === "slot" ? "SLOT MACHINE" : "SPIN WHEEL"}</div>
                 <div className="mt-1 text-lg font-semibold">Putar untuk dapat hadiah</div>
               </div>
               <div className="grid justify-items-end gap-2">
@@ -1299,6 +1657,43 @@ export default function Home() {
             </div>
 
             <div className="mt-6">
+              {spinMode === "slot" ? (
+                /* ── SLOT MACHINE MODE ── */
+                <div className="relative mx-auto w-full max-w-[440px]">
+                  {/* Special effect overlay */}
+                  {specialEffectKey !== null && (
+                    <SpecialBurstOverlay key={specialEffectKey} />
+                  )}
+                  {/* Reels container */}
+                  <div className="flex gap-3 rounded-3xl border border-white/10 bg-zinc-950/60 p-4">
+                    {!wheelSegments.length ? [0, 1, 2].map((i) => (
+                      <div key={i} className="flex h-24 flex-1 items-center justify-center rounded-2xl border border-white/10 bg-zinc-900">
+                        <Star className="h-6 w-6 animate-pulse text-zinc-600" aria-hidden />
+                      </div>
+                    )) : [0, 1, 2].map((reelIdx) => (
+                      <SlotReel
+                        key={reelIdx}
+                        reelIdx={reelIdx}
+                        segments={wheelSegments}
+                        result={result}
+                        isSpinning={isSpinning}
+                        isSlotPaused={isSlotPaused}
+                        isHighlighted={!isSpinning && !!result}
+                      />
+                    ))}
+                  </div>
+
+                  {/* Status label */}
+                  <div className="mt-3 flex items-center justify-center">
+                    <div className="rounded-full border border-white/10 bg-zinc-950/70 px-4 py-2 text-xs text-zinc-100">
+                      {isSpinning ? "SPINNING..." : result ? (
+                        <span className="font-semibold text-rose-300">{result.label}{result.amount != null ? ` +${result.amount}` : ""}</span>
+                      ) : "READY"}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+              /* ── WHEEL MODE (original) ── */
               <div className="relative mx-auto w-full max-w-[440px]">
                 <div className="pointer-events-none absolute left-1/2 top-[8px] z-20 h-0 w-0 -translate-x-1/2 border-x-[14px] border-t-[26px] border-x-transparent border-t-fuchsia-400 drop-shadow" />
 
@@ -1447,11 +1842,12 @@ export default function Home() {
                   </div>
                 ) : null}
               </div>
+              )}
 
-              <div className="mt-5 rounded-3xl border border-white/10 bg-zinc-950/35 p-5">
+              <div className="mt-5 rounded-3xl border border-rose-400/10 bg-zinc-950/35 p-5">
                 <div className="flex items-start justify-between gap-3">
                   <div>
-                    <div className="text-sm font-semibold">Border Ramadan 2026</div>
+                    <div className="text-sm font-semibold">Border Gotoubun no Hanayome</div>
                     <div className="mt-1 text-xs text-zinc-200/70">Progress menuju border</div>
                   </div>
                   <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-2 text-xs text-zinc-100">
@@ -1463,7 +1859,7 @@ export default function Home() {
                 <div className="mt-4">
                   <div className="h-3 overflow-hidden rounded-full border border-white/10 bg-zinc-950">
                     <div
-                      className="h-full rounded-full bg-gradient-to-r from-fuchsia-500 to-cyan-400"
+                      className="h-full rounded-full bg-gradient-to-r from-rose-500 to-pink-400"
                       style={{ width: `${pityPct}%` }}
                     />
                   </div>
@@ -1478,7 +1874,7 @@ export default function Home() {
                     <button
                       onClick={() => handleSpin(1)}
                       disabled={isSpinning}
-                      className="inline-flex h-12 w-full items-center justify-center rounded-2xl bg-gradient-to-r from-fuchsia-500 to-cyan-400 px-8 font-semibold text-zinc-950 shadow-[0_12px_35px_rgba(34,211,238,0.18)] transition hover:brightness-110 disabled:opacity-60"
+                      className="inline-flex h-12 w-full items-center justify-center rounded-2xl bg-gradient-to-r from-rose-500 to-pink-400 px-8 font-semibold text-zinc-950 shadow-[0_12px_35px_rgba(244,63,94,0.25)] transition hover:brightness-110 disabled:opacity-60"
                     >
                       <Ticket className="mr-2 h-4 w-4" aria-hidden />
                       {isSpinning
@@ -1630,7 +2026,7 @@ export default function Home() {
               Terjadi kesalahan
             </div>
           ) : shopItems.length ? (
-            <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
               {shopItems.map((item) => {
                 const affordable = userToken >= item.sharp_cost;
                 const isLoading = exchangeLoadingCode === item.code;
@@ -1638,51 +2034,44 @@ export default function Home() {
                 return (
                   <div
                     key={item.code}
-                    className="rounded-3xl border border-white/10 bg-zinc-950/25 p-5"
+                    className="flex flex-col rounded-3xl border border-white/10 bg-zinc-950/25 p-4"
                   >
-                    <div className="flex items-start gap-4">
-                      <div className="h-14 w-14 overflow-hidden rounded-2xl border border-white/10 bg-zinc-900">
-                        {item.image_url ? (
-                          // eslint-disable-next-line @next/next/no-img-element
-                          <img
-                            src={item.image_url}
-                            alt={item.title}
-                            className="h-full w-full object-cover"
-                          />
-                        ) : item.type === "border" ? (
-                          <div className="flex h-full w-full items-center justify-center">
-                            <Gift className="h-6 w-6 text-zinc-100" aria-hidden />
-                          </div>
-                        ) : (
-                          <div className="flex h-full w-full items-center justify-center">
-                            <Sparkles className="h-6 w-6 text-zinc-100" aria-hidden />
-                          </div>
-                        )}
-                      </div>
+                    <div className="mx-auto h-20 w-20 overflow-hidden rounded-2xl border border-white/10 bg-zinc-900">
+                      {item.image_url ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          src={item.image_url}
+                          alt={item.title}
+                          className="h-full w-full object-cover"
+                        />
+                      ) : item.type === "border" ? (
+                        <div className="flex h-full w-full items-center justify-center">
+                          <Gift className="h-7 w-7 text-zinc-100" aria-hidden />
+                        </div>
+                      ) : (
+                        <div className="flex h-full w-full items-center justify-center">
+                          <Sparkles className="h-7 w-7 text-zinc-100" aria-hidden />
+                        </div>
+                      )}
+                    </div>
 
-                      <div className="min-w-0 flex-1">
-                        <div className="truncate text-sm font-semibold text-zinc-100">
-                          {item.title}
-                        </div>
-                        <div className="mt-1 inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-zinc-100">
-                          {/* eslint-disable-next-line @next/next/no-img-element */}
-                          <img
-                            src="/img/sharp.png"
-                            alt="Sharp Token"
-                            className="h-3.5 w-3.5 rounded-sm"
-                          />
-                          <span className="tabular-nums font-semibold">{item.sharp_cost}</span>
-                          <span className="text-zinc-200/70">Sharp Token</span>
-                        </div>
+                    <div className="mt-3 flex-1 text-center">
+                      <div className="line-clamp-2 text-xs font-semibold leading-snug text-zinc-100">
+                        {item.title}
+                      </div>
+                      <div className="mt-2 inline-flex items-center gap-1 rounded-full border border-white/10 bg-white/5 px-2 py-1 text-xs text-zinc-100">
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img src="/img/sharp.png" alt="Sharp Token" className="h-3 w-3 rounded-sm" />
+                        <span className="tabular-nums font-semibold">{item.sharp_cost}</span>
                       </div>
                     </div>
 
                     <button
                       onClick={() => handleExchange(item.code)}
                       disabled={isLoading || !affordable}
-                      className="mt-4 inline-flex h-11 w-full items-center justify-center rounded-2xl bg-gradient-to-r from-fuchsia-500 to-cyan-400 px-6 text-sm font-semibold text-zinc-950 transition hover:brightness-110 disabled:opacity-60"
+                      className="mt-3 inline-flex h-9 w-full items-center justify-center rounded-2xl bg-gradient-to-r from-rose-500 to-pink-400 px-3 text-xs font-semibold text-zinc-950 transition hover:brightness-110 disabled:opacity-60"
                     >
-                      {isLoading ? "MEMPROSES..." : affordable ? "TUKAR" : "TOKEN KURANG"}
+                      {isLoading ? "..." : affordable ? "TUKAR" : "KURANG"}
                     </button>
                   </div>
                 );
